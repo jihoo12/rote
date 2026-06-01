@@ -1,5 +1,6 @@
 mod object;
 mod sidebar;
+mod graph;
 
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
@@ -7,19 +8,20 @@ use gtk::{
     gio, glib,
     prelude::*,
     Application, ApplicationWindow, Box, Button, HeaderBar, Label,
-    Orientation, Paned, ScrolledWindow, TextView,
+    Orientation, Paned, ScrolledWindow, Stack, TextView, ToggleButton,
 };
 
 use object::{Group, ObjectKind, Node};
 use sidebar::SidebarTree;
+use graph::GraphView;
 
 const APP_ID: &str = "org.gtk_rs.NoteGraph";
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
 struct AppState {
-    workspace:    Option<PathBuf>,   // open directory (root Group)
-    current_path: Option<PathBuf>,   // currently edited object
+    workspace:    Option<PathBuf>,
+    current_path: Option<PathBuf>,
     is_modified:  bool,
 }
 
@@ -70,14 +72,11 @@ fn build_ui(app: &Application) {
         .hexpand(true)
         .build();
 
-    // ── Links bar (shows [[outgoing links]] for the open object) ──────────────
+    // ── Links bar ─────────────────────────────────────────────────────────────
     let links_label = Label::builder()
         .label("Links: —")
         .halign(gtk::Align::Start)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(4)
-        .margin_bottom(4)
+        .margin_start(16).margin_end(16).margin_top(4).margin_bottom(4)
         .wrap(true)
         .build();
     links_label.add_css_class("dim-label");
@@ -86,20 +85,24 @@ fn build_ui(app: &Application) {
     let status_label = Label::builder()
         .label("No file open")
         .halign(gtk::Align::Start)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(2)
-        .margin_bottom(4)
+        .margin_start(16).margin_end(16).margin_top(2).margin_bottom(4)
         .build();
     status_label.add_css_class("dim-label");
 
-    // ── Right panel (editor + links + status) ─────────────────────────────────
-    let right_panel = Box::builder()
-        .orientation(Orientation::Vertical)
-        .build();
-    right_panel.append(&editor_scroll);
-    right_panel.append(&links_label);
-    right_panel.append(&status_label);
+    // ── Editor panel ──────────────────────────────────────────────────────────
+    let editor_panel = Box::builder().orientation(Orientation::Vertical).build();
+    editor_panel.append(&editor_scroll);
+    editor_panel.append(&links_label);
+    editor_panel.append(&status_label);
+
+    // ── Graph view ────────────────────────────────────────────────────────────
+    let graph_view = Rc::new(GraphView::new());
+
+    // ── Stack: editor ↔ graph ─────────────────────────────────────────────────
+    let stack = Stack::builder().vexpand(true).hexpand(true).build();
+    stack.add_named(&editor_panel,       Some("editor"));
+    stack.add_named(&graph_view.widget,  Some("graph"));
+    stack.set_visible_child_name("editor");
 
     // ── Sidebar ───────────────────────────────────────────────────────────────
     let sidebar = Rc::new(SidebarTree::new());
@@ -108,7 +111,7 @@ fn build_ui(app: &Application) {
     let paned = Paned::builder()
         .orientation(Orientation::Horizontal)
         .start_child(&sidebar.widget)
-        .end_child(&right_panel)
+        .end_child(&stack)
         .position(220)
         .build();
 
@@ -140,12 +143,19 @@ fn build_ui(app: &Application) {
         .tooltip_text("Redo (Ctrl+Y)")
         .build();
 
+    // Graph toggle button (Ctrl+G)
+    let btn_graph = ToggleButton::builder()
+        .icon_name("view-grid-symbolic")
+        .tooltip_text("Toggle graph view (Ctrl+G)")
+        .build();
+
     header.pack_start(&btn_open_ws);
     header.pack_start(&btn_new_note);
     header.pack_start(&btn_new_group);
     header.pack_start(&btn_save);
     header.pack_end(&btn_redo);
     header.pack_end(&btn_undo);
+    header.pack_end(&btn_graph);
 
     // ── Window ────────────────────────────────────────────────────────────────
     let window = ApplicationWindow::builder()
@@ -159,7 +169,6 @@ fn build_ui(app: &Application) {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    // Update window title
     let update_title = {
         let window = window.clone();
         let state  = state.clone();
@@ -181,13 +190,15 @@ fn build_ui(app: &Application) {
         }
     };
 
-    // Load an object into the editor
     let load_object = {
         let buffer       = buffer.clone();
         let state        = state.clone();
         let links_label  = links_label.clone();
         let status_label = status_label.clone();
         let update_title = update_title.clone();
+        let graph_view   = graph_view.clone();
+        let stack        = stack.clone();
+        let btn_graph    = btn_graph.clone();
         Rc::new(move |path: PathBuf| {
             let obj = if path.is_dir() {
                 ObjectKind::Group(Group::new(path.clone()))
@@ -197,22 +208,26 @@ fn build_ui(app: &Application) {
 
             let content = obj.content();
             buffer.set_text(&content);
-            buffer.set_enable_undo(true); // reset undo stack on load
+            buffer.set_enable_undo(true);
 
-            // Links
             let lnks = obj.links();
-            if lnks.is_empty() {
-                links_label.set_label("Links: —");
+            links_label.set_label(&if lnks.is_empty() {
+                "Links: —".into()
             } else {
-                links_label.set_label(&format!("Links: {}", lnks.join("  ·  ")));
-            }
+                format!("Links: {}", lnks.join("  ·  "))
+            });
 
-            // Status
             let kind = if obj.is_group() { "group" } else { "node" };
-            status_label.set_label(&format!(
-                "{kind}  ·  {}",
-                path.display()
-            ));
+            status_label.set_label(&format!("{kind}  ·  {}", path.display()));
+
+            // Highlight in graph if visible
+            graph_view.select_path(&path);
+
+            // Switch to editor view when opening a node
+            if !obj.is_group() && btn_graph.is_active() {
+                btn_graph.set_active(false);
+                stack.set_visible_child_name("editor");
+            }
 
             let mut s = state.borrow_mut();
             s.current_path = Some(path);
@@ -222,12 +237,37 @@ fn build_ui(app: &Application) {
         })
     };
 
+    // ── Graph toggle ──────────────────────────────────────────────────────────
+    {
+        let stack      = stack.clone();
+        let state      = state.clone();
+        let graph_view = graph_view.clone();
+        btn_graph.connect_toggled(move |btn| {
+            if btn.is_active() {
+                // Rebuild graph from workspace root
+                if let Some(ws) = state.borrow().workspace.clone() {
+                    graph_view.load(&ws);
+                }
+                stack.set_visible_child_name("graph");
+            } else {
+                stack.set_visible_child_name("editor");
+            }
+        });
+    }
+
+    // ── Graph node click → open in editor ────────────────────────────────────
+    {
+        let load_object = load_object.clone();
+        graph_view.on_node_click(move |path| {
+            load_object(path);
+        });
+    }
+
     // ── Sidebar row click → open object ──────────────────────────────────────
     {
         let sidebar     = sidebar.clone();
         let load_object = load_object.clone();
-        // Grab the list widget *before* the move so we don't borrow + move sidebar simultaneously.
-        let list = sidebar.list.clone();
+        let list        = sidebar.list.clone();
         list.connect_row_activated(move |_, row| {
             let idx = row.index() as usize;
             if let Some(path) = sidebar.path_at(idx) {
@@ -238,9 +278,10 @@ fn build_ui(app: &Application) {
 
     // ── Open workspace ────────────────────────────────────────────────────────
     {
-        let window      = window.clone();
-        let state       = state.clone();
-        let sidebar     = sidebar.clone();
+        let window       = window.clone();
+        let state        = state.clone();
+        let sidebar      = sidebar.clone();
+        let graph_view   = graph_view.clone();
         let update_title = update_title.clone();
         btn_open_ws.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::builder()
@@ -250,12 +291,14 @@ fn build_ui(app: &Application) {
             let window       = window.clone();
             let state        = state.clone();
             let sidebar      = sidebar.clone();
+            let graph_view   = graph_view.clone();
             let update_title = update_title.clone();
             dialog.select_folder(Some(&window), gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
                         state.borrow_mut().workspace = Some(path.clone());
                         sidebar.load(&path);
+                        graph_view.load(&path);
                         update_title();
                     }
                 }
@@ -275,9 +318,7 @@ fn build_ui(app: &Application) {
             let text = buffer.text(&start, &end, false);
             drop(s);
             if obj.save_content(&text).is_ok() {
-                let mut s = state.borrow_mut();
-                s.is_modified = false;
-                drop(s);
+                state.borrow_mut().is_modified = false;
                 update_title();
             }
         });
@@ -285,12 +326,11 @@ fn build_ui(app: &Application) {
 
     // ── New note ──────────────────────────────────────────────────────────────
     {
-        let window   = window.clone();
-        let state    = state.clone();
-        let sidebar  = sidebar.clone();
+        let window      = window.clone();
+        let state       = state.clone();
+        let sidebar     = sidebar.clone();
         let load_object = load_object.clone();
         btn_new_note.connect_clicked(move |_| {
-            // Determine target directory
             let dir = {
                 let s = state.borrow();
                 s.current_path.as_ref().map(|p| {
@@ -298,22 +338,19 @@ fn build_ui(app: &Application) {
                 }).or_else(|| s.workspace.clone())
             };
             let Some(dir) = dir else { return };
-
             let dialog = gtk::FileDialog::builder()
                 .title("New Note")
                 .modal(true)
                 .initial_folder(&gio::File::for_path(&dir))
                 .build();
-            let window  = window.clone();
-            let sidebar = sidebar.clone();
-            let state   = state.clone();
+            let window      = window.clone();
+            let sidebar     = sidebar.clone();
+            let state       = state.clone();
             let load_object = load_object.clone();
             dialog.save(Some(&window), gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
-                        // Create empty file
                         let _ = std::fs::write(&path, "");
-                        // Refresh sidebar
                         if let Some(ws) = state.borrow().workspace.clone() {
                             sidebar.load(&ws);
                         }
@@ -326,9 +363,9 @@ fn build_ui(app: &Application) {
 
     // ── New group ─────────────────────────────────────────────────────────────
     {
-        let window  = window.clone();
-        let state   = state.clone();
-        let sidebar = sidebar.clone();
+        let window      = window.clone();
+        let state       = state.clone();
+        let sidebar     = sidebar.clone();
         let load_object = load_object.clone();
         btn_new_group.connect_clicked(move |_| {
             let dir = {
@@ -338,16 +375,14 @@ fn build_ui(app: &Application) {
                 }).or_else(|| s.workspace.clone())
             };
             let Some(dir) = dir else { return };
-
-            // Use FileDialog: the chosen save path becomes the new group directory.
             let dialog = gtk::FileDialog::builder()
-                .title("Create Group (choose location + name)")
+                .title("Create Group")
                 .modal(true)
                 .initial_folder(&gio::File::for_path(&dir))
                 .build();
-            let window  = window.clone();
-            let sidebar = sidebar.clone();
-            let state   = state.clone();
+            let window      = window.clone();
+            let sidebar     = sidebar.clone();
+            let state       = state.clone();
             let load_object = load_object.clone();
             dialog.save(Some(&window), gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result {
@@ -367,7 +402,7 @@ fn build_ui(app: &Application) {
     { let b = buffer.clone(); btn_undo.connect_clicked(move |_| { b.undo(); }); }
     { let b = buffer.clone(); btn_redo.connect_clicked(move |_| { b.redo(); }); }
 
-    // ── Track edits (links + modified flag) ───────────────────────────────────
+    // ── Track edits ───────────────────────────────────────────────────────────
     {
         let state        = state.clone();
         let links_label  = links_label.clone();
@@ -375,35 +410,35 @@ fn build_ui(app: &Application) {
         buffer.connect_changed(move |buf| {
             state.borrow_mut().is_modified = true;
             update_title();
-
-            // Re-parse links on every change
             let (s, e) = buf.bounds();
             let text   = buf.text(&s, &e, false);
             let lnks   = object::extract_links(&text);
-            if lnks.is_empty() {
-                links_label.set_label("Links: —");
+            links_label.set_label(&if lnks.is_empty() {
+                "Links: —".into()
             } else {
-                links_label.set_label(&format!("Links: {}", lnks.join("  ·  ")));
-            }
+                format!("Links: {}", lnks.join("  ·  "))
+            });
         });
     }
 
     // ── Keyboard shortcuts ────────────────────────────────────────────────────
     {
-        let controller  = gtk::EventControllerKey::new();
-        let btn_open_ws = btn_open_ws.clone();
-        let btn_save    = btn_save.clone();
+        let controller   = gtk::EventControllerKey::new();
+        let btn_open_ws  = btn_open_ws.clone();
+        let btn_save     = btn_save.clone();
         let btn_new_note = btn_new_note.clone();
-        let btn_undo    = btn_undo.clone();
-        let btn_redo    = btn_redo.clone();
+        let btn_undo     = btn_undo.clone();
+        let btn_redo     = btn_redo.clone();
+        let btn_graph    = btn_graph.clone();
         controller.connect_key_pressed(move |_, key, _, mods| {
-            let ctrl  = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
             match (ctrl, key) {
-                (true, gtk::gdk::Key::o) => { btn_open_ws.emit_clicked();  glib::Propagation::Stop }
-                (true, gtk::gdk::Key::s) => { btn_save.emit_clicked();     glib::Propagation::Stop }
-                (true, gtk::gdk::Key::n) => { btn_new_note.emit_clicked(); glib::Propagation::Stop }
-                (true, gtk::gdk::Key::z) => { btn_undo.emit_clicked();     glib::Propagation::Stop }
-                (true, gtk::gdk::Key::y) => { btn_redo.emit_clicked();     glib::Propagation::Stop }
+                (true, gtk::gdk::Key::o) => { btn_open_ws.emit_clicked();         glib::Propagation::Stop }
+                (true, gtk::gdk::Key::s) => { btn_save.emit_clicked();            glib::Propagation::Stop }
+                (true, gtk::gdk::Key::n) => { btn_new_note.emit_clicked();        glib::Propagation::Stop }
+                (true, gtk::gdk::Key::z) => { btn_undo.emit_clicked();            glib::Propagation::Stop }
+                (true, gtk::gdk::Key::y) => { btn_redo.emit_clicked();            glib::Propagation::Stop }
+                (true, gtk::gdk::Key::g) => { btn_graph.set_active(!btn_graph.is_active()); glib::Propagation::Stop }
                 _ => glib::Propagation::Proceed,
             }
         });
