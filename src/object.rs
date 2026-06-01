@@ -114,8 +114,8 @@ impl Object for Group {
         index.push_str("## Contents\n\n");
         for child in &children {
             let (icon, name) = match child {
-                ObjectKind::Node(n)  => ("📄", n.name()),
-                ObjectKind::Group(g) => ("📁", g.name()),
+                ObjectKind::Node(n)  => ("node", n.name()),
+                ObjectKind::Group(g) => ("group", g.name()),
             };
             index.push_str(&format!("- {icon} [[{name}]]\n"));
         }
