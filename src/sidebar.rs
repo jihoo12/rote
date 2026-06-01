@@ -47,7 +47,6 @@ impl SidebarTree {
 
     /// Populate the sidebar from `root`. Clears previous entries.
     pub fn load(&self, root: &Path) {
-        // Remove all existing rows
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -64,7 +63,7 @@ impl SidebarTree {
         depth: u32,
         paths: &mut Vec<PathBuf>,
     ) {
-        // Add the group row itself (skip the root at depth 0 — shown in title)
+        // Add the group row itself (skip root at depth 0 — shown in title bar)
         if depth > 0 {
             self.push_row(&group.path, &group.name, depth - 1, true, paths);
         }
@@ -90,10 +89,9 @@ impl SidebarTree {
         paths: &mut Vec<PathBuf>,
     ) {
         let icon = if is_group { "📁 " } else { "📄 " };
-        let label_text = format!("{icon}{name}");
 
         let label = Label::builder()
-            .label(&label_text)
+            .label(&format!("{icon}{name}"))
             .halign(gtk::Align::Start)
             .margin_start((indent * 16 + 8) as i32)
             .margin_top(4)
